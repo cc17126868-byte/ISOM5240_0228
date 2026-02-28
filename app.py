@@ -1,7 +1,7 @@
 import streamlit as st
 from PIL import Image
 import time
-from transformers import pipeline
+from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration
 import requests
 from io import BytesIO
 
@@ -42,6 +42,15 @@ with st.sidebar:
     
     st.divider()
     
+    # 模型选择（可选，让用户可以选小模型）
+    use_small_model = st.checkbox(
+        "使用轻量级模型（更快，但效果略差）",
+        value=False,
+        help="如果遇到内存问题，可以勾选这个选项"
+    )
+    
+    st.divider()
+    
     # 关于
     st.markdown("""
     ### ℹ️ 关于
@@ -50,29 +59,91 @@ with st.sidebar:
     2. **故事生成**: GPT-2
     """)
 
-# 加载模型（使用缓存）
+# 加载模型（使用缓存）- 修复版本
 @st.cache_resource
-def load_models():
-    """加载AI模型"""
+def load_models(use_small=False):
+    """加载AI模型 - 修复版本"""
     try:
-        with st.spinner("正在加载图片分析模型..."):
-            # 图片描述模型
-            image_to_text = pipeline("image-to-text", 
-                                   model="Salesforce/blip-image-captioning-base")
+        models = {}
         
-        with st.spinner("正在加载故事生成模型..."):
-            # 故事生成模型
-            story_generator = pipeline("text-generation",
-                                     model="gpt2",
-                                     max_new_tokens=300)
+        with st.status("正在加载AI模型...", expanded=True) as status:
+            
+            # 方案1: 使用正确的image-to-text任务
+            st.write("⏳ 尝试加载图片分析模型...")
+            try:
+                if use_small:
+                    # 使用更小的模型
+                    models['image'] = pipeline("image-to-text", 
+                                             model="nlpconnect/vit-gpt2-image-captioning")
+                else:
+                    # 使用标准模型
+                    models['image'] = pipeline("image-to-text", 
+                                             model="Salesforce/blip-image-captioning-base")
+                st.write("✅ 图片分析模型加载成功")
+            except Exception as e:
+                st.write(f"⚠️ 标准加载失败，尝试备用方案: {str(e)[:50]}...")
+                
+                # 方案2: 备用方案 - 使用专门的processor和model
+                try:
+                    if use_small:
+                        model_name = "nlpconnect/vit-gpt2-image-captioning"
+                    else:
+                        model_name = "Salesforce/blip-image-captioning-base"
+                    
+                    processor = BlipProcessor.from_pretrained(model_name)
+                    model = BlipForConditionalGeneration.from_pretrained(model_name)
+                    models['image_processor'] = processor
+                    models['image_model'] = model
+                    st.write("✅ 使用备用方案加载成功")
+                except Exception as e2:
+                    st.error(f"备用方案也失败: {str(e2)}")
+                    return None
+            
+            # 加载故事生成模型
+            st.write("⏳ 加载故事生成模型...")
+            try:
+                if use_small:
+                    models['story'] = pipeline("text-generation",
+                                             model="distilgpt2",
+                                             max_new_tokens=300)
+                else:
+                    models['story'] = pipeline("text-generation",
+                                             model="gpt2",
+                                             max_new_tokens=300)
+                st.write("✅ 故事生成模型加载成功")
+            except Exception as e:
+                st.error(f"故事模型加载失败: {str(e)}")
+                return None
+            
+            status.update(label="✅ 模型加载完成!", state="complete")
         
-        return image_to_text, story_generator
+        return models
     except Exception as e:
         st.error(f"模型加载失败: {str(e)}")
-        return None, None
+        return None
+
+def analyze_image(image, models):
+    """分析图片内容"""
+    try:
+        # 检查是否有标准pipeline
+        if 'image' in models:
+            result = models['image'](image)
+            return result[0]['generated_text']
+        
+        # 使用备用方案
+        elif 'image_processor' in models and 'image_model' in models:
+            inputs = models['image_processor'](image, return_tensors="pt")
+            out = models['image_model'].generate(**inputs, max_length=50)
+            description = models['image_processor'].decode(out[0], skip_special_tokens=True)
+            return description
+        
+        else:
+            return "无法分析图片内容"
+    except Exception as e:
+        return f"图片分析失败: {str(e)}"
 
 # 生成故事的函数
-def generate_story(image_description, style, length):
+def generate_story(image_description, style, length, story_model):
     """根据图片描述生成故事"""
     
     # 根据风格设置故事开头
@@ -88,12 +159,13 @@ def generate_story(image_description, style, length):
     
     try:
         # 生成故事
-        result = story_generator(
+        result = story_model(
             prompt,
             max_length=length,
             num_return_sequences=1,
             temperature=0.8,
-            do_sample=True
+            do_sample=True,
+            pad_token_id=50256  # GPT-2的pad token
         )
         return result[0]['generated_text']
     except Exception as e:
@@ -128,11 +200,11 @@ with col1:
         url = st.text_input("输入图片URL", placeholder="https://example.com/image.jpg")
         if url:
             try:
-                response = requests.get(url)
+                response = requests.get(url, timeout=10)
                 image = Image.open(BytesIO(response.content))
                 image_source = "url"
-            except:
-                st.error("无法加载图片，请检查URL是否有效")
+            except Exception as e:
+                st.error(f"无法加载图片: {str(e)}")
     
     # 显示图片
     if image is not None:
@@ -145,37 +217,37 @@ with col2:
     st.subheader("📖 生成的故事")
     
     # 加载模型
-    if 'models_loaded' not in st.session_state:
-        with st.status("正在加载AI模型...", expanded=True) as status:
-            st.write("⏳ 加载图片分析模型...")
-            st.write("⏳ 加载故事生成模型...")
-            image_model, story_model = load_models()
-            if image_model and story_model:
-                st.session_state['image_model'] = image_model
-                st.session_state['story_model'] = story_model
-                st.session_state['models_loaded'] = True
-                status.update(label="✅ 模型加载完成!", state="complete")
+    if 'models' not in st.session_state:
+        models = load_models(use_small_model)
+        if models:
+            st.session_state['models'] = models
+            st.rerun()  # 重新运行以更新UI
     
     # 生成故事按钮
-    if image is not None and st.session_state.get('models_loaded', False):
+    if image is not None and 'models' in st.session_state:
         if st.button("✨ 生成故事", type="primary", use_container_width=True):
             with st.spinner("AI正在创作中..."):
                 try:
                     # 步骤1: 分析图片
-                    st.info("🔍 正在分析图片内容...")
-                    image_result = st.session_state['image_model'](image)
-                    image_description = image_result[0]['generated_text']
+                    status_text = st.empty()
+                    status_text.info("🔍 正在分析图片内容...")
+                    
+                    image_description = analyze_image(image, st.session_state['models'])
                     
                     # 显示图片描述
-                    st.success(f"📝 图片描述: {image_description}")
+                    status_text.success(f"📝 图片描述: {image_description}")
                     
                     # 步骤2: 生成故事
-                    st.info("📖 正在创作故事...")
+                    status_text.info("📖 正在创作故事...")
                     story = generate_story(
                         image_description, 
                         story_style, 
-                        story_length
+                        story_length,
+                        st.session_state['models']['story']
                     )
+                    
+                    # 清除状态文本
+                    status_text.empty()
                     
                     # 显示故事
                     st.markdown("### ✨ 你的专属故事")
@@ -207,13 +279,15 @@ with col2:
                         'style': story_style
                     })
                     
+                    st.success("✅ 故事生成完成！")
+                    
                 except Exception as e:
                     st.error(f"生成过程中出错: {str(e)}")
     
     elif image is None:
         st.info("👆 请先在左侧上传一张图片")
     
-    elif not st.session_state.get('models_loaded', False):
+    elif 'models' not in st.session_state:
         st.warning("⏳ 模型正在加载中，请稍候...")
 
 # 历史故事展示
@@ -225,10 +299,13 @@ if st.session_state.get('story_history'):
         with st.expander(f"故事 {i+1} - {item['style']}风格"):
             col1, col2 = st.columns(2)
             with col1:
-                st.image(item['image'], caption="原图", width=200)
+                # 调整图片大小
+                img_copy = item['image'].copy()
+                img_copy.thumbnail((200, 200))
+                st.image(img_copy, caption="原图")
             with col2:
                 st.write(f"**图片描述:** {item['description']}")
-                st.write(f"**故事片段:** {item['story'][:100]}...")
+                st.write(f"**故事片段:** {item['story'][:150]}...")
 
 # 页脚
 st.divider()
