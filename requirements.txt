@@ -1,2 +1,7 @@
 streamlit
 Pillow
+transformers
+torch
+requests
+accelerate
+sentencepiece
